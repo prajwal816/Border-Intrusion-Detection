@@ -428,39 +428,45 @@ def render_classification_bars(predictions: Dict[str, float]):
 def render_alert_panel(alerts: List[Dict]):
     """Render scrolling alert log panel."""
     if not alerts:
-        st.markdown("""
-        <div class="comm-log" style="color: #39FF14;">
-            <div style="text-align: center; padding: 20px; color: #6b7280;">
-                ◉ SYSTEM NOMINAL — NO ALERTS
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            '<div class="comm-log" style="color: #39FF14;">'
+            '<div style="text-align: center; padding: 20px; color: #6b7280;">'
+            '◉ SYSTEM NOMINAL — NO ALERTS'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
         return
     
-    alert_html = ""
+    rows = []
     for alert in reversed(alerts[-15:]):
         level = alert.get("threat_level", alert.get("alert_level", "NORMAL"))
         color = ALERT_COLORS.get(level, THEME["accent_green"])
         event = alert.get("event_type", alert.get("event", "unknown")).upper()
         conf = alert.get("confidence", 0)
-        node = alert.get("node_id", "??")
+        conf_pct = int(conf * 100)
+        node_id = alert.get("node_id", "??")
         ts = alert.get("timestamp", "")
         
-        icon = "🔴" if level in ("CRITICAL", "HIGH_ALERT", "HIGH") else "🟡" if level in ("MODERATE", "SUSPICIOUS") else "🟢"
+        if level in ("CRITICAL", "HIGH_ALERT", "HIGH"):
+            icon = "&#x1F534;"   # 🔴
+        elif level in ("MODERATE", "SUSPICIOUS"):
+            icon = "&#x1F7E1;"   # 🟡
+        else:
+            icon = "&#x1F7E2;"   # 🟢
         
-        alert_html += f"""
-        <div style="padding: 6px 0; border-bottom: 1px solid #1a2332;">
-            <span style="color: #6b7280; font-size: 0.7rem;">{ts}</span>
-            <span style="color: {color}; font-weight: 700;"> {icon} [{level}]</span>
-            <span style="color: #c5c8c6;"> Node-{node} | {event} ({conf:.0%})</span>
-        </div>
-        """
+        rows.append(
+            f'<div style="padding:6px 0;border-bottom:1px solid #1a2332;">'
+            f'<span style="color:#6b7280;font-size:0.7rem;">{ts}</span> '
+            f'<span style="color:{color};font-weight:700;">{icon} [{level}]</span> '
+            f'<span style="color:#c5c8c6;">Node-{node_id} | {event} ({conf_pct}%)</span>'
+            f'</div>'
+        )
     
-    st.markdown(f"""
-    <div class="comm-log" style="max-height: 300px;">
-        {alert_html}
-    </div>
-    """, unsafe_allow_html=True)
+    body = "".join(rows)
+    st.markdown(
+        f'<div class="comm-log" style="max-height:300px;">{body}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ──────────────────────────────────────────────

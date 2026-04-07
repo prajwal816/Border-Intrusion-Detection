@@ -12,12 +12,14 @@ import sys
 import time
 import threading
 import logging
+import random
 import numpy as np
 import streamlit as st
 from datetime import datetime
 
 # Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _SCRIPT_DIR)
 
 from src.audio import AudioCapture, SOUNDDEVICE_AVAILABLE
 from src.model import AudioClassifier
@@ -53,16 +55,28 @@ logger = logging.getLogger(__name__)
 # Model & System Paths
 # ──────────────────────────────────────────────
 
-# Resolve paths robustly for Streamlit
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_H5 = os.path.join(_SCRIPT_DIR, "models", "border_intrusion_model.h5")
 MODEL_TFLITE = os.path.join(_SCRIPT_DIR, "models", "border_intrusion_model.tflite")
 DATASET_DIR = os.path.join(_SCRIPT_DIR, "dataset")
 
-logger.info(f"[PATHS] Script dir: {_SCRIPT_DIR}")
-logger.info(f"[PATHS] Model H5 exists: {os.path.exists(MODEL_H5)} → {MODEL_H5}")
-logger.info(f"[PATHS] Model TFLite exists: {os.path.exists(MODEL_TFLITE)} → {MODEL_TFLITE}")
-logger.info(f"[PATHS] Dataset exists: {os.path.isdir(DATASET_DIR)} → {DATASET_DIR}")
+
+# ──────────────────────────────────────────────
+# Cached Model Loading (survives Streamlit reruns)
+# ──────────────────────────────────────────────
+
+@st.cache_resource
+def load_model():
+    """Load model once and cache across reruns. TFLite preferred for speed."""
+    # Prefer TFLite (loads in <100ms vs 30s+ for H5)
+    if os.path.exists(MODEL_TFLITE):
+        logger.info(f"[CACHE] Loading TFLite model: {MODEL_TFLITE}")
+        return AudioClassifier(model_path=MODEL_TFLITE)
+    elif os.path.exists(MODEL_H5):
+        logger.info(f"[CACHE] Loading Keras model: {MODEL_H5}")
+        return AudioClassifier(model_path=MODEL_H5)
+    else:
+        logger.warning("[CACHE] No model found, using fallback")
+        return AudioClassifier(model_path=None)
 
 
 # ──────────────────────────────────────────────
@@ -78,13 +92,11 @@ def init_session_state():
         "current_predictions": {"footstep": 0.0, "gunshot": 0.0, "noise": 0.0},
         "prediction_history": [],
         "nodes_initialized": False,
-        "nodes": {},
-        "transmitters": {},
+        "node": None,
+        "transmitter": None,
         "base_station": None,
         "decision_engine": None,
-        "classifier": None,
         "audio_capture": None,
-        "all_comm_logs": [],
         "system_start_time": None,
         "total_cycles": 0,
         "last_rssi": -70.0,
@@ -101,30 +113,17 @@ def initialize_system():
     if st.session_state.nodes_initialized:
         return
     
-    # Initialize nodes
-    positions = [(2, 8), (8, 7), (5, 2)]
-    for i in range(3):
-        node_id = f"{i+1:02d}"
-        node = VirtualESP32Node(node_id=node_id, position=positions[i])
-        node.boot()
-        st.session_state.nodes[node_id] = node
-        st.session_state.transmitters[node_id] = LoRaTransmitter(node_id=node_id)
+    # Initialize single node
+    node = VirtualESP32Node(node_id="01", position=(5, 5))
+    node.boot()
+    st.session_state.node = node
+    st.session_state.transmitter = LoRaTransmitter(node_id="01")
     
     # Base station
     st.session_state.base_station = BaseStationReceiver(station_id="BASE-01")
     
     # Decision engine
     st.session_state.decision_engine = DecisionEngine()
-    
-    # ML Model — prefer H5 for reliability, fall back to TFLite
-    if os.path.exists(MODEL_H5):
-        model_path = MODEL_H5
-    elif os.path.exists(MODEL_TFLITE):
-        model_path = MODEL_TFLITE
-    else:
-        model_path = None
-    logger.info(f"[INIT] Loading model from: {model_path}")
-    st.session_state.classifier = AudioClassifier(model_path=model_path)
     
     # Audio capture
     audio_mode = "live" if SOUNDDEVICE_AVAILABLE else "replay"
@@ -142,9 +141,9 @@ def initialize_system():
 def run_detection_cycle():
     """Run one complete detection cycle: capture → inference → decision → transmit."""
     audio_capture = st.session_state.audio_capture
-    classifier = st.session_state.classifier
-    node = st.session_state.nodes["01"]  # Primary node uses live audio
-    transmitter = st.session_state.transmitters["01"]
+    classifier = load_model()  # cached
+    node = st.session_state.node
+    transmitter = st.session_state.transmitter
     base_station = st.session_state.base_station
     decision_engine = st.session_state.decision_engine
     
@@ -194,65 +193,8 @@ def run_detection_cycle():
     st.session_state.last_snr = packet.snr_db
     st.session_state.last_latency = packet.latency_ms
     
-    # Collect comm logs
-    tx_logs = transmitter.get_logs(5)
-    rx_logs = base_station.get_logs(5)
-    st.session_state.all_comm_logs = tx_logs + rx_logs
-    
     node.return_to_idle()
     st.session_state.total_cycles += 1
-    
-    # --- Simulate other nodes with random dataset samples ---
-    _simulate_secondary_nodes()
-
-
-def _simulate_secondary_nodes():
-    """Simulate activity for Node 02 and Node 03."""
-    import random
-    
-    for node_id in ["02", "03"]:
-        node = st.session_state.nodes[node_id]
-        transmitter = st.session_state.transmitters[node_id]
-        base_station = st.session_state.base_station
-        decision_engine = st.session_state.decision_engine
-        
-        # Random activity (50% chance each cycle)
-        if random.random() > 0.5:
-            node.enter_listening()
-            node.capture_audio_frame()
-            
-            # Generate random predictions (mostly noise for secondary nodes)
-            r = random.random()
-            if r > 0.92:
-                # Rare footstep event
-                preds = {"footstep": random.uniform(0.6, 0.95),
-                         "gunshot": random.uniform(0.01, 0.1),
-                         "noise": random.uniform(0.05, 0.2)}
-            elif r > 0.97:
-                # Very rare gunshot event
-                preds = {"footstep": random.uniform(0.01, 0.1),
-                         "gunshot": random.uniform(0.7, 0.98),
-                         "noise": random.uniform(0.01, 0.1)}
-            else:
-                # Normal noise
-                preds = {"footstep": random.uniform(0.01, 0.15),
-                         "gunshot": random.uniform(0.01, 0.08),
-                         "noise": random.uniform(0.75, 0.95)}
-            
-            # Normalize
-            total = sum(preds.values())
-            preds = {k: v/total for k, v in preds.items()}
-            
-            inference_time = random.uniform(15, 45)
-            result = node.process_frame(preds, inference_time)
-            
-            decision_engine.evaluate(preds, node_id=node_id)
-            
-            node.prepare_transmission()
-            packet = transmitter.transmit(result, node.get_status())
-            base_station.receive_packet(packet)
-            
-            node.return_to_idle()
 
 
 # ──────────────────────────────────────────────
@@ -263,6 +205,9 @@ def main():
     init_session_state()
     initialize_system()
     inject_custom_css()
+    
+    # Get cached classifier info
+    classifier = load_model()
     
     # ── Header ──
     render_header()
@@ -299,17 +244,15 @@ def main():
         st.markdown("---")
         st.markdown("### System Info")
         
-        classifier = st.session_state.classifier
-        if classifier:
-            model_info = classifier.get_model_info()
-            st.markdown(f"""
-            <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: #6b7280;">
-                <div>Model: <span style="color: #39FF14;">{model_info['model_type'].upper()}</span></div>
-                <div>Classes: <span style="color: #c5c8c6;">{', '.join(model_info['classes'])}</span></div>
-                <div>Avg Inference: <span style="color: #FFB000;">{model_info['avg_inference_ms']:.1f}ms</span></div>
-                <div>Audio Mode: <span style="color: #00D4FF;">{st.session_state.audio_mode.upper()}</span></div>
-            </div>
-            """, unsafe_allow_html=True)
+        model_info = classifier.get_model_info()
+        st.markdown(f"""
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: #6b7280;">
+            <div>Model: <span style="color: #39FF14;">{model_info['model_type'].upper()}</span></div>
+            <div>Classes: <span style="color: #c5c8c6;">{', '.join(model_info['classes'])}</span></div>
+            <div>Avg Inference: <span style="color: #FFB000;">{model_info['avg_inference_ms']:.1f}ms</span></div>
+            <div>Audio Mode: <span style="color: #00D4FF;">{st.session_state.audio_mode.upper()}</span></div>
+        </div>
+        """, unsafe_allow_html=True)
         
         # Stats
         st.markdown("---")
@@ -344,12 +287,11 @@ def main():
     if st.session_state.system_running:
         run_detection_cycle()
     
-    # Row 1: Node Status Cards
-    st.markdown("## ◈ Node Network Status")
-    node_cols = st.columns(3)
-    for i, (node_id, node) in enumerate(st.session_state.nodes.items()):
-        with node_cols[i]:
-            render_node_card(node.get_status())
+    # Row 1: Node Status Card (single node)
+    st.markdown("## ◈ Node Status")
+    node = st.session_state.node
+    if node:
+        render_node_card(node.get_status())
     
     st.markdown("---")
     
@@ -383,10 +325,9 @@ def main():
                 icon = "🟢"
             
             st.markdown(f"""
-            <div style="text-align: center; padding: 10px; background: #131920; border: 1px solid {color}44;
+            <div style="text-align: center; padding: 10px; background: #131920; border: 1px solid rgba(57,255,20,0.25);
                         border-radius: 8px; margin-top: 10px;">
-                <div style="font-family: 'Orbitron', monospace; font-size: 1.2rem; color: {color};
-                            text-shadow: 0 0 15px {color}66;">
+                <div style="font-family: 'Orbitron', monospace; font-size: 1.2rem; color: {color};">
                     {icon} {dominant.upper()}
                 </div>
                 <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: #6b7280;">
@@ -409,7 +350,7 @@ def main():
     
     with col_map:
         st.markdown("## ◈ Deployment Map")
-        node_statuses = [node.get_status() for node in st.session_state.nodes.values()]
+        node_statuses = [node.get_status()] if node else []
         map_fig = render_deployment_map(node_statuses)
         st.plotly_chart(map_fig, use_container_width=True, key="map")
     
@@ -421,11 +362,8 @@ def main():
     
     with col_tx:
         st.markdown("### LoRa TX Log")
-        all_tx = []
-        for tx in st.session_state.transmitters.values():
-            all_tx.extend(tx.get_logs(10))
-        all_tx.sort()
-        render_comm_log(all_tx[-20:])
+        tx = st.session_state.transmitter
+        render_comm_log(tx.get_logs(20) if tx else [])
     
     with col_rx:
         st.markdown("### Base Station RX Log")

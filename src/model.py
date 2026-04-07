@@ -3,6 +3,7 @@ AI Model Integration — Audio Classification Model
 ===================================================
 Loads trained CNN model for real-time acoustic classification.
 Supports both Keras (.h5) and TFLite (.tflite) inference.
+Uses TFLite by default for fast loading in Streamlit.
 """
 
 import os
@@ -22,9 +23,9 @@ class AudioClassifier:
     Audio classification model for border intrusion detection.
     
     Supports:
+    - TFLite model (edge-optimized, fast loading)
     - Keras H5 model (full TensorFlow)
-    - TFLite model (edge-optimized)
-    - Fallback random classifier for testing
+    - Fallback heuristic classifier for testing
     """
     
     def __init__(self, model_path: Optional[str] = None):
@@ -37,6 +38,7 @@ class AudioClassifier:
         self._inference_times = []
         
         if model_path and os.path.exists(model_path):
+            logger.info(f"[MODEL] Attempting to load model from: {model_path}")
             self._load_model(model_path)
         else:
             logger.warning(f"[MODEL] Model not found at {model_path}, using fallback classifier")
@@ -53,13 +55,14 @@ class AudioClassifier:
                 logger.error(f"[MODEL] Unsupported model format: {path}")
                 self.model_type = "fallback"
         except Exception as e:
-            logger.error(f"[MODEL] Failed to load model: {e}")
+            logger.error(f"[MODEL] Failed to load model: {e}", exc_info=True)
             self.model_type = "fallback"
     
     def _load_keras(self, path: str):
         """Load Keras H5 model."""
         import tensorflow as tf
-        self.model = tf.keras.models.load_model(path)
+        self.model = tf.keras.models.load_model(path, compile=False)
+        self.model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
         self.model_type = "keras"
         self.input_shape = self.model.input_shape
         logger.info(f"[MODEL] Keras model loaded: {path}")
@@ -68,11 +71,17 @@ class AudioClassifier:
     
     def _load_tflite(self, path: str):
         """Load TFLite model."""
-        import tensorflow as tf
-        self.interpreter = tf.lite.Interpreter(model_path=path)
+        try:
+            import tensorflow as tf
+            self.interpreter = tf.lite.Interpreter(model_path=path)
+        except ImportError:
+            # Try tflite_runtime as fallback
+            import tflite_runtime.interpreter as tflite
+            self.interpreter = tflite.Interpreter(model_path=path)
+        
         self.interpreter.allocate_tensors()
         input_details = self.interpreter.get_input_details()
-        self.input_shape = input_details[0]['shape']
+        self.input_shape = tuple(input_details[0]['shape'])
         self.model_type = "tflite"
         logger.info(f"[MODEL] TFLite model loaded: {path}")
         logger.info(f"[MODEL] Input shape: {self.input_shape}")
@@ -137,15 +146,10 @@ class AudioClassifier:
         Fallback classifier using simple energy-based heuristics.
         Used when no trained model is available.
         """
-        # Use feature statistics as rough classification heuristic
         if features is not None and features.size > 0:
             energy = np.mean(np.abs(features))
             variance = np.var(features)
             max_val = np.max(np.abs(features))
-            
-            # High energy + high variance → likely gunshot
-            # Moderate energy + rhythmic → likely footstep
-            # Low energy → likely noise
             
             if max_val > 3.0 and variance > 2.0:
                 base = np.array([0.10, 0.75, 0.15])
@@ -154,7 +158,6 @@ class AudioClassifier:
             else:
                 base = np.array([0.15, 0.05, 0.80])
             
-            # Add slight randomness
             noise = np.random.dirichlet(np.ones(3) * 10) * 0.15
             probs = base + noise
             probs = probs / probs.sum()
@@ -173,7 +176,7 @@ class AudioClassifier:
     def get_model_info(self) -> Dict:
         """Get model metadata."""
         return {
-            "model_type": self.model_type,
+            "model_type": self.model_type or "fallback",
             "model_path": self.model_path,
             "input_shape": str(self.input_shape),
             "classes": self.class_labels,
