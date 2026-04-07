@@ -54,9 +54,16 @@ logger = logging.getLogger(__name__)
 # Model & System Paths
 # ──────────────────────────────────────────────
 
-MODEL_H5 = os.path.join(PROJECT_ROOT, "models", "border_intrusion_model.h5")
-MODEL_TFLITE = os.path.join(PROJECT_ROOT, "models", "border_intrusion_model.tflite")
-DATASET_DIR = os.path.join(PROJECT_ROOT, "dataset")
+# Resolve paths robustly for Streamlit
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_H5 = os.path.join(_SCRIPT_DIR, "models", "border_intrusion_model.h5")
+MODEL_TFLITE = os.path.join(_SCRIPT_DIR, "models", "border_intrusion_model.tflite")
+DATASET_DIR = os.path.join(_SCRIPT_DIR, "dataset")
+
+logger.info(f"[PATHS] Script dir: {_SCRIPT_DIR}")
+logger.info(f"[PATHS] Model H5 exists: {os.path.exists(MODEL_H5)} → {MODEL_H5}")
+logger.info(f"[PATHS] Model TFLite exists: {os.path.exists(MODEL_TFLITE)} → {MODEL_TFLITE}")
+logger.info(f"[PATHS] Dataset exists: {os.path.isdir(DATASET_DIR)} → {DATASET_DIR}")
 
 
 # ──────────────────────────────────────────────
@@ -110,8 +117,14 @@ def initialize_system():
     # Decision engine
     st.session_state.decision_engine = DecisionEngine()
     
-    # ML Model
-    model_path = MODEL_TFLITE if os.path.exists(MODEL_TFLITE) else MODEL_H5
+    # ML Model — prefer H5 for reliability, fall back to TFLite
+    if os.path.exists(MODEL_H5):
+        model_path = MODEL_H5
+    elif os.path.exists(MODEL_TFLITE):
+        model_path = MODEL_TFLITE
+    else:
+        model_path = None
+    logger.info(f"[INIT] Loading model from: {model_path}")
     st.session_state.classifier = AudioClassifier(model_path=model_path)
     
     # Audio capture
