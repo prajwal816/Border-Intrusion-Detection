@@ -17,8 +17,7 @@ import streamlit as st
 from datetime import datetime
 
 # Add project root to path
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.audio import AudioCapture, SOUNDDEVICE_AVAILABLE
 from src.model import AudioClassifier
