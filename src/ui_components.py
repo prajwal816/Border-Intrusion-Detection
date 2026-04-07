@@ -386,11 +386,11 @@ def render_classification_bars(predictions: Dict[str, float]):
     colors = []
     for label, val in zip(labels, values):
         if "gunshot" in label.lower() or "balastic" in label.lower():
-            colors.append(THEME["accent_red"] if val > 0.5 else "#FF313166")
+            colors.append(THEME["accent_red"] if val > 0.5 else "rgba(255, 49, 49, 0.4)")
         elif "footstep" in label.lower():
-            colors.append(THEME["accent_amber"] if val > 0.7 else "#FFB00066")
+            colors.append(THEME["accent_amber"] if val > 0.7 else "rgba(255, 176, 0, 0.4)")
         else:
-            colors.append(THEME["accent_green"] if val > 0.5 else "#39FF1466")
+            colors.append(THEME["accent_green"] if val > 0.5 else "rgba(57, 255, 20, 0.4)")
     
     fig = go.Figure()
     fig.add_trace(go.Bar(
