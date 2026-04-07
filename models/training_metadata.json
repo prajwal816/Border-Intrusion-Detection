@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-04-08T01:47:42.070410",
+  "dataset_size": 1122,
+  "train_size": 784,
+  "val_size": 169,
+  "test_size": 169,
+  "test_accuracy": 0.9408283829689026,
+  "test_loss": 0.15555408596992493,
+  "epochs_trained": 42,
+  "best_val_accuracy": 0.9467455744743347,
+  "class_labels": [
+    "footstep",
+    "gunshot",
+    "noise"
+  ],
+  "input_shape": [
+    40,
+    44,
+    1
+  ],
+  "model_params": 423555
+}
