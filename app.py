@@ -61,27 +61,21 @@ DATASET_DIR = os.path.join(_SCRIPT_DIR, "dataset")
 
 
 # ──────────────────────────────────────────────
-# Cached Model Loading (survives Streamlit reruns)
-# ──────────────────────────────────────────────
-
-@st.cache_resource
-def load_model():
-    """Load model once and cache across reruns. TFLite preferred for speed."""
-    # Prefer TFLite (loads in <100ms vs 30s+ for H5)
-    if os.path.exists(MODEL_TFLITE):
-        logger.info(f"[CACHE] Loading TFLite model: {MODEL_TFLITE}")
-        return AudioClassifier(model_path=MODEL_TFLITE)
-    elif os.path.exists(MODEL_H5):
-        logger.info(f"[CACHE] Loading Keras model: {MODEL_H5}")
-        return AudioClassifier(model_path=MODEL_H5)
-    else:
-        logger.warning("[CACHE] No model found, using fallback")
-        return AudioClassifier(model_path=None)
-
-
-# ──────────────────────────────────────────────
 # Session State Initialization
 # ──────────────────────────────────────────────
+
+def _get_classifier():
+    """Get or create the classifier (loads TF in background thread)."""
+    if "classifier" not in st.session_state:
+        # Prefer TFLite (smaller, faster to load)
+        if os.path.exists(MODEL_TFLITE):
+            st.session_state.classifier = AudioClassifier(model_path=MODEL_TFLITE)
+        elif os.path.exists(MODEL_H5):
+            st.session_state.classifier = AudioClassifier(model_path=MODEL_H5)
+        else:
+            st.session_state.classifier = AudioClassifier(model_path=None)
+    return st.session_state.classifier
+
 
 def init_session_state():
     """Initialize all session state variables."""
@@ -141,7 +135,7 @@ def initialize_system():
 def run_detection_cycle():
     """Run one complete detection cycle: capture → inference → decision → transmit."""
     audio_capture = st.session_state.audio_capture
-    classifier = load_model()  # cached
+    classifier = _get_classifier()
     node = st.session_state.node
     transmitter = st.session_state.transmitter
     base_station = st.session_state.base_station
@@ -206,8 +200,8 @@ def main():
     initialize_system()
     inject_custom_css()
     
-    # Get cached classifier info
-    classifier = load_model()
+    # Get classifier (loads TF in background)
+    classifier = _get_classifier()
     
     # ── Header ──
     render_header()
