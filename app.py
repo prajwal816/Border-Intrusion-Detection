@@ -55,8 +55,7 @@ logger = logging.getLogger(__name__)
 # Model & System Paths
 # ──────────────────────────────────────────────
 
-MODEL_H5 = os.path.join(_SCRIPT_DIR, "models", "border_intrusion_model.h5")
-MODEL_TFLITE = os.path.join(_SCRIPT_DIR, "models", "border_intrusion_model.tflite")
+MODEL_ONNX = os.path.join(_SCRIPT_DIR, "models", "border_intrusion_model.onnx")
 DATASET_DIR = os.path.join(_SCRIPT_DIR, "dataset")
 
 
@@ -64,29 +63,21 @@ DATASET_DIR = os.path.join(_SCRIPT_DIR, "dataset")
 # Session State Initialization
 # ──────────────────────────────────────────────
 
-@st.cache_resource
-def _load_classifier():
-    """Load classifier once, cached across reruns. TFLite preferred."""
-    if os.path.exists(MODEL_TFLITE):
-        return AudioClassifier(model_path=MODEL_TFLITE)
-    elif os.path.exists(MODEL_H5):
-        return AudioClassifier(model_path=MODEL_H5)
-    return AudioClassifier(model_path=None)
-
-
 def init_session_state():
     """Initialize all session state variables."""
     defaults = {
         "system_running": False,
-        "audio_mode": "replay",
+        "audio_mode": "live",
         "current_frame": np.zeros(22050, dtype=np.float32),
-        "current_predictions": {"footstep": 0.0, "gunshot": 0.0, "noise": 0.0},
+        "current_predictions": {"footstep": 0.0, "gunshot": 0.0, "noise": 1.0},
+        "smoothed_predictions": {"footstep": 0.0, "gunshot": 0.0, "noise": 1.0},
         "prediction_history": [],
         "nodes_initialized": False,
         "node": None,
         "transmitter": None,
         "base_station": None,
         "decision_engine": None,
+        "classifier": None,
         "audio_capture": None,
         "system_start_time": None,
         "total_cycles": 0,
@@ -116,23 +107,34 @@ def initialize_system():
     # Decision engine
     st.session_state.decision_engine = DecisionEngine()
     
-    # Audio capture — use REPLAY mode for reliable classification demo
-    # (mic signal is too weak for meaningful classification)
-    st.session_state.audio_mode = "replay"
+    # ML Model — ONNX Runtime (no TensorFlow needed)
+    with st.spinner("Loading TinyML model..."):
+        if os.path.exists(MODEL_ONNX):
+            print(f"[INIT] Loading ONNX model: {MODEL_ONNX}")
+            st.session_state.classifier = AudioClassifier(model_path=MODEL_ONNX)
+        else:
+            print(f"[INIT] ❌ No ONNX model found at {MODEL_ONNX}")
+            st.session_state.classifier = AudioClassifier(model_path=None)
+    
+    print(f"[INIT] Final model type: {st.session_state.classifier.model_type}")
+    
+    # Audio capture — LIVE from laptop microphone
+    audio_mode = "live" if SOUNDDEVICE_AVAILABLE else "replay"
+    st.session_state.audio_mode = audio_mode
     st.session_state.audio_capture = AudioCapture(
-        mode="replay",
+        mode=audio_mode,
         replay_dir=DATASET_DIR
     )
     
     st.session_state.nodes_initialized = True
     st.session_state.system_start_time = time.time()
-    logger.info("System initialized successfully")
+    logger.info(f"System initialized — Model: {st.session_state.classifier.model_type}, Audio: {audio_mode}")
 
 
 def run_detection_cycle():
     """Run one complete detection cycle: capture → inference → decision → transmit."""
     audio_capture = st.session_state.audio_capture
-    classifier = _load_classifier()
+    classifier = st.session_state.classifier
     node = st.session_state.node
     transmitter = st.session_state.transmitter
     base_station = st.session_state.base_station
@@ -143,40 +145,55 @@ def run_detection_cycle():
     frame = audio_capture.get_frame(timeout=1.5)
     
     if frame is None:
-        frame = np.random.randn(22050).astype(np.float32) * 0.01
+        frame = np.random.randn(22050).astype(np.float32) * 0.001
     
     st.session_state.current_frame = frame
     
-    # 2. Check wake-on-sound
+    # 2. Check energy level (noise gate)
     energy = audio_capture.compute_energy(frame)
+    NOISE_GATE_THRESHOLD = 0.02  # Below this = silence/noise
     
     # 3. Capture & process
     node.capture_audio_frame()
     
     # 4. Extract features & run inference
-    features = audio_capture.preprocess_for_model(frame)
-    predictions = classifier.predict(features)
+    if energy > NOISE_GATE_THRESHOLD:
+        # Meaningful audio — run real inference
+        features = audio_capture.preprocess_for_model(frame)
+        predictions = classifier.predict(features)
+    else:
+        # Below noise gate — classify as noise (don't run model on silence)
+        predictions = {"footstep": 0.02, "gunshot": 0.01, "noise": 0.97}
+    
     inference_time = classifier.get_last_inference_time()
     
-    st.session_state.current_predictions = predictions
+    # 5. Smooth predictions (exponential moving average)
+    SMOOTH_ALPHA = 0.4  # 0=fully smooth, 1=no smoothing
+    prev = st.session_state.smoothed_predictions
+    smoothed = {}
+    for k in predictions:
+        smoothed[k] = SMOOTH_ALPHA * predictions[k] + (1 - SMOOTH_ALPHA) * prev.get(k, 0.0)
+    st.session_state.smoothed_predictions = smoothed
+    st.session_state.current_predictions = smoothed
+    
     st.session_state.prediction_history.append({
         "timestamp": datetime.now().strftime("%H:%M:%S"),
-        "predictions": predictions.copy(),
+        "predictions": smoothed.copy(),
     })
     if len(st.session_state.prediction_history) > 50:
         st.session_state.prediction_history = st.session_state.prediction_history[-30:]
     
-    # 5. Node processes inference
-    result = node.process_frame(predictions, inference_time)
+    # 6. Node processes inference
+    result = node.process_frame(smoothed, inference_time)
     
-    # 6. Decision engine
-    alert = decision_engine.evaluate(predictions, node_id="01")
+    # 7. Decision engine
+    alert = decision_engine.evaluate(smoothed, node_id="01")
     
-    # 7. LoRa transmission
+    # 8. LoRa transmission
     node.prepare_transmission()
     packet = transmitter.transmit(result, node.get_status())
     
-    # 8. Base station receives
+    # 9. Base station receives
     base_alert = base_station.receive_packet(packet)
     
     # Store signal metrics
@@ -197,8 +214,8 @@ def main():
     initialize_system()
     inject_custom_css()
     
-    # Get classifier (loads TF in background)
-    classifier = _load_classifier()
+    # Get classifier from session state
+    classifier = st.session_state.classifier
     
     # ── Header ──
     render_header()

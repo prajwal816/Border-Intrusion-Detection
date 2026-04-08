@@ -1,13 +1,16 @@
 """
-AI Model Integration — Audio Classification Model
+AI Model Integration — Subprocess-based Inference
 ===================================================
-Loads trained CNN model for real-time acoustic classification.
-Synchronous loading — TFLite loads in ~0.03s after TF import (~3s).
+Runs ONNX/TFLite model in a separate Python process
+to avoid DLL loading issues inside Streamlit.
 """
 
 import os
+import sys
+import json
 import time
 import logging
+import subprocess
 import numpy as np
 from typing import Dict, Optional
 
@@ -15,59 +18,58 @@ logger = logging.getLogger(__name__)
 
 CLASS_LABELS = ["footstep", "gunshot", "noise"]
 
+_SERVER_SCRIPT = os.path.join(os.path.dirname(__file__), "inference_server.py")
+
 
 class AudioClassifier:
-    """Audio classifier with TFLite/Keras/fallback support."""
+    """Audio classifier using subprocess inference."""
 
     def __init__(self, model_path: Optional[str] = None):
         self.model_path = model_path
-        self.model = None
-        self.interpreter = None
         self.model_type = "fallback"
         self.input_shape = None
         self.class_labels = CLASS_LABELS
         self._inference_times = []
+        self._process = None
 
         if model_path and os.path.exists(model_path):
-            logger.info(f"[MODEL] Loading from: {model_path}")
-            self._load_model(model_path)
+            print(f"[MODEL] Starting inference subprocess for: {model_path}")
+            self._start_server(model_path)
         else:
-            logger.warning(f"[MODEL] No model at {model_path}, using fallback")
+            print(f"[MODEL] No model at {model_path}, using fallback")
 
-    def _load_model(self, path: str):
+    def _start_server(self, path: str):
         try:
-            if path.endswith(".tflite"):
-                self._load_tflite(path)
-            elif path.endswith(".h5") or path.endswith(".keras"):
-                self._load_keras(path)
-            else:
-                logger.error(f"[MODEL] Unsupported format: {path}")
-        except Exception as e:
-            logger.error(f"[MODEL] Load failed: {e}", exc_info=True)
+            self._process = subprocess.Popen(
+                [sys.executable, _SERVER_SCRIPT, path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            # Wait for ready signal
+            ready_line = self._process.stdout.readline().strip()
+            if ready_line:
+                ready = json.loads(ready_line)
+                if ready.get("status") == "ready":
+                    self.model_type = ready.get("model_type", "unknown")
+                    print(f"[MODEL] ✅ Subprocess ready — model: {self.model_type}")
+                    return
+                elif ready.get("error"):
+                    print(f"[MODEL] ❌ Server error: {ready['error']}")
+
             self.model_type = "fallback"
-
-    def _load_keras(self, path: str):
-        import tensorflow as tf
-        self.model = tf.keras.models.load_model(path, compile=False)
-        self.model_type = "keras"
-        self.input_shape = self.model.input_shape
-        logger.info(f"[MODEL] Keras loaded: {self.input_shape}")
-
-    def _load_tflite(self, path: str):
-        import tensorflow as tf
-        self.interpreter = tf.lite.Interpreter(model_path=path)
-        self.interpreter.allocate_tensors()
-        inp = self.interpreter.get_input_details()
-        self.input_shape = tuple(inp[0]['shape'])
-        self.model_type = "tflite"
-        logger.info(f"[MODEL] TFLite loaded: {self.input_shape}")
+        except Exception as e:
+            print(f"[MODEL] ❌ Failed to start subprocess: {e}")
+            self._process = None
+            self.model_type = "fallback"
 
     def predict(self, features: np.ndarray) -> Dict[str, float]:
         t0 = time.time()
-        if self.model_type == "keras" and self.model is not None:
-            probs = self.model.predict(features, verbose=0)[0]
-        elif self.model_type == "tflite" and self.interpreter is not None:
-            probs = self._predict_tflite(features)
+
+        if self._process and self._process.poll() is None:
+            probs = self._predict_subprocess(features)
         else:
             probs = self._predict_fallback(features)
 
@@ -84,13 +86,21 @@ class AudioClassifier:
             result = {k: v / total for k, v in result.items()}
         return result
 
-    def _predict_tflite(self, features):
-        inp = self.interpreter.get_input_details()
-        out = self.interpreter.get_output_details()
-        features = features.astype(inp[0]['dtype'])
-        self.interpreter.set_tensor(inp[0]['index'], features)
-        self.interpreter.invoke()
-        return self.interpreter.get_tensor(out[0]['index'])[0]
+    def _predict_subprocess(self, features):
+        try:
+            request = json.dumps({"features": features.tolist()})
+            self._process.stdin.write(request + "\n")
+            self._process.stdin.flush()
+            response_line = self._process.stdout.readline().strip()
+            if response_line:
+                response = json.loads(response_line)
+                if "probs" in response:
+                    return np.array(response["probs"])
+                elif "error" in response:
+                    print(f"[MODEL] Inference error: {response['error']}")
+        except Exception as e:
+            print(f"[MODEL] Subprocess comm error: {e}")
+        return self._predict_fallback(None)
 
     def _predict_fallback(self, features):
         if features is not None and features.size > 0:
@@ -122,3 +132,12 @@ class AudioClassifier:
             "classes": self.class_labels,
             "avg_inference_ms": round(self.get_avg_inference_time(), 2),
         }
+
+    def __del__(self):
+        if self._process and self._process.poll() is None:
+            try:
+                self._process.stdin.write("QUIT\n")
+                self._process.stdin.flush()
+                self._process.wait(timeout=3)
+            except Exception:
+                self._process.kill()

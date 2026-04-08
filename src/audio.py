@@ -40,6 +40,7 @@ class AudioCapture:
     HOP_LENGTH = 512
     N_FFT = 2048
     ENERGY_THRESHOLD = 0.005     # Wake-on-sound energy threshold
+    AUDIO_GAIN = 20.0            # Amplification factor for weak mic signals
     
     def __init__(self, mode: str = "live", replay_dir: Optional[str] = None):
         self.mode = mode.lower()
@@ -70,11 +71,29 @@ class AudioCapture:
             random.shuffle(self._replay_files)
             logger.info(f"[AUDIO] Loaded {len(self._replay_files)} files for replay mode")
     
+    def _find_stereo_mix_device(self):
+        """Find Stereo Mix device for system audio loopback capture."""
+        if not SOUNDDEVICE_AVAILABLE:
+            return None
+        try:
+            devs = sd.query_devices()
+            for i, d in enumerate(devs):
+                name = d['name'].lower()
+                if d['max_input_channels'] > 0 and ('stereo mix' in name or 'loopback' in name):
+                    logger.info(f"[AUDIO] Found loopback device: [{i}] {d['name']}")
+                    return i
+        except Exception:
+            pass
+        return None
+
     def _audio_callback(self, indata, frames, time_info, status):
         """Callback for sounddevice InputStream."""
         if status:
             logger.warning(f"[AUDIO] Stream status: {status}")
         audio_data = indata[:, 0].copy().astype(np.float32)
+        # Amplify weak mic signal
+        audio_data = audio_data * self.AUDIO_GAIN
+        audio_data = np.clip(audio_data, -1.0, 1.0)
         try:
             self._audio_queue.put_nowait(audio_data)
         except queue.Full:
@@ -89,15 +108,20 @@ class AudioCapture:
         self.is_running = True
         if self.mode == "live" and SOUNDDEVICE_AVAILABLE:
             try:
+                # Try Stereo Mix first (captures system audio when playing sounds)
+                device = self._find_stereo_mix_device()
+                device_name = "Stereo Mix (system audio)" if device else "Default Microphone"
+                
                 self._stream = sd.InputStream(
                     samplerate=self.SAMPLE_RATE,
                     channels=1,
                     dtype='float32',
                     blocksize=self.FRAME_SIZE,
+                    device=device,  # None = default mic
                     callback=self._audio_callback
                 )
                 self._stream.start()
-                logger.info("[AUDIO] Live microphone capture started")
+                logger.info(f"[AUDIO] Live capture started via: {device_name}")
             except Exception as e:
                 logger.error(f"[AUDIO] Failed to start microphone: {e}")
                 logger.info("[AUDIO] Falling back to replay mode")
