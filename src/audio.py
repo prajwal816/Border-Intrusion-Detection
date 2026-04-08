@@ -5,6 +5,7 @@ Simulates MEMS microphone input for the VirtualESP32Node.
 Uses sounddevice for real-time capture and librosa for MFCC extraction.
 """
 
+import os
 import numpy as np
 import librosa
 import threading
@@ -40,7 +41,6 @@ class AudioCapture:
     HOP_LENGTH = 512
     N_FFT = 2048
     ENERGY_THRESHOLD = 0.005     # Wake-on-sound energy threshold
-    AUDIO_GAIN = 20.0            # Amplification factor for weak mic signals
     
     def __init__(self, mode: str = "live", replay_dir: Optional[str] = None):
         self.mode = mode.lower()
@@ -71,29 +71,11 @@ class AudioCapture:
             random.shuffle(self._replay_files)
             logger.info(f"[AUDIO] Loaded {len(self._replay_files)} files for replay mode")
     
-    def _find_stereo_mix_device(self):
-        """Find Stereo Mix device for system audio loopback capture."""
-        if not SOUNDDEVICE_AVAILABLE:
-            return None
-        try:
-            devs = sd.query_devices()
-            for i, d in enumerate(devs):
-                name = d['name'].lower()
-                if d['max_input_channels'] > 0 and ('stereo mix' in name or 'loopback' in name):
-                    logger.info(f"[AUDIO] Found loopback device: [{i}] {d['name']}")
-                    return i
-        except Exception:
-            pass
-        return None
-
     def _audio_callback(self, indata, frames, time_info, status):
-        """Callback for sounddevice InputStream."""
+        """Callback for sounddevice InputStream (used for replay fallback)."""
         if status:
             logger.warning(f"[AUDIO] Stream status: {status}")
         audio_data = indata[:, 0].copy().astype(np.float32)
-        # Amplify weak mic signal
-        audio_data = audio_data * self.AUDIO_GAIN
-        audio_data = np.clip(audio_data, -1.0, 1.0)
         try:
             self._audio_queue.put_nowait(audio_data)
         except queue.Full:
@@ -106,33 +88,48 @@ class AudioCapture:
     def start(self):
         """Start audio capture."""
         self.is_running = True
-        if self.mode == "live" and SOUNDDEVICE_AVAILABLE:
-            try:
-                # Try Stereo Mix first (captures system audio when playing sounds)
-                device = self._find_stereo_mix_device()
-                device_name = "Stereo Mix (system audio)" if device else "Default Microphone"
-                
-                self._stream = sd.InputStream(
-                    samplerate=self.SAMPLE_RATE,
-                    channels=1,
-                    dtype='float32',
-                    blocksize=self.FRAME_SIZE,
-                    device=device,  # None = default mic
-                    callback=self._audio_callback
-                )
-                self._stream.start()
-                logger.info(f"[AUDIO] Live capture started via: {device_name}")
-            except Exception as e:
-                logger.error(f"[AUDIO] Failed to start microphone: {e}")
-                logger.info("[AUDIO] Falling back to replay mode")
-                self.mode = "replay"
-                if not self._replay_files and self.replay_dir:
-                    self._load_replay_files()
+        if self.mode == "live":
+            self._start_audio_subprocess()
         
         if self.mode == "replay":
             self._thread = threading.Thread(target=self._replay_loop, daemon=True)
             self._thread.start()
             logger.info("[AUDIO] Replay mode started")
+    
+    def _start_audio_subprocess(self):
+        """Launch a separate Python process for mic capture."""
+        import subprocess, sys, json, tempfile
+        
+        self._audio_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "_audio_frame.npy"
+        )
+        server_script = os.path.join(os.path.dirname(__file__), "audio_server.py")
+        
+        try:
+            self._audio_proc = subprocess.Popen(
+                [sys.executable, server_script, self._audio_file],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            # Wait for ready signal
+            ready_line = self._audio_proc.stdout.readline().strip()
+            if ready_line:
+                msg = json.loads(ready_line)
+                if msg.get("status") == "ready":
+                    logger.info("[AUDIO] Mic subprocess started — capturing from laptop microphone")
+                    return
+                else:
+                    logger.error(f"[AUDIO] Subprocess error: {msg.get('error')}")
+        except Exception as e:
+            logger.error(f"[AUDIO] Failed to start audio subprocess: {e}")
+        
+        # Fallback to replay
+        logger.info("[AUDIO] Falling back to replay mode")
+        self.mode = "replay"
+        if not self._replay_files and self.replay_dir:
+            self._load_replay_files()
     
     def _replay_loop(self):
         """Background thread for replaying dataset audio files."""
@@ -162,6 +159,9 @@ class AudioCapture:
     def stop(self):
         """Stop audio capture."""
         self.is_running = False
+        if hasattr(self, '_audio_proc') and self._audio_proc:
+            self._audio_proc.kill()
+            self._audio_proc = None
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
@@ -172,16 +172,33 @@ class AudioCapture:
         """
         Get the next audio frame.
         
-        Returns:
-            numpy array of shape (FRAME_SIZE,) or None if timeout
+        LIVE: reads from shared file written by audio subprocess.
+        REPLAY: reads from queue.
         """
-        try:
-            frame = self._audio_queue.get(timeout=timeout)
-            with self._lock:
-                self._current_frame = frame.copy()
-            return frame
-        except queue.Empty:
+        if self.mode == "live" and hasattr(self, '_audio_file'):
+            try:
+                if os.path.exists(self._audio_file):
+                    frame = np.load(self._audio_file, allow_pickle=False)
+                    if frame is not None and len(frame) > 0:
+                        frame = frame.astype(np.float32)
+                        if len(frame) < self.FRAME_SIZE:
+                            frame = np.pad(frame, (0, self.FRAME_SIZE - len(frame)))
+                        elif len(frame) > self.FRAME_SIZE:
+                            frame = frame[:self.FRAME_SIZE]
+                        with self._lock:
+                            self._current_frame = frame.copy()
+                        return frame
+            except Exception as e:
+                pass  # File might be mid-write, try next cycle
             return None
+        else:
+            try:
+                frame = self._audio_queue.get(timeout=timeout)
+                with self._lock:
+                    self._current_frame = frame.copy()
+                return frame
+            except queue.Empty:
+                return None
     
     def get_current_frame(self) -> np.ndarray:
         """Get the most recent frame (non-blocking)."""

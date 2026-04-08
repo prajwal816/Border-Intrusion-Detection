@@ -151,7 +151,9 @@ def run_detection_cycle():
     
     # 2. Check energy level (noise gate)
     energy = audio_capture.compute_energy(frame)
-    NOISE_GATE_THRESHOLD = 0.02  # Below this = silence/noise
+    rms = float(np.sqrt(np.mean(frame**2)))
+    peak = float(np.max(np.abs(frame)))
+    NOISE_GATE_THRESHOLD = 0.01
     
     # 3. Capture & process
     node.capture_audio_frame()
@@ -161,9 +163,15 @@ def run_detection_cycle():
         # Meaningful audio — run real inference
         features = audio_capture.preprocess_for_model(frame)
         predictions = classifier.predict(features)
+        gate_status = "OPEN"
     else:
-        # Below noise gate — classify as noise (don't run model on silence)
+        # Below noise gate — classify as noise
         predictions = {"footstep": 0.02, "gunshot": 0.01, "noise": 0.97}
+        gate_status = "CLOSED"
+    
+    # Debug output
+    dominant = max(predictions, key=predictions.get)
+    print(f"[CYCLE {st.session_state.total_cycles:03d}] RMS={rms:.6f} Peak={peak:.4f} Energy={energy:.6f} Gate={gate_status} → {dominant}({predictions[dominant]:.1%})")
     
     inference_time = classifier.get_last_inference_time()
     
@@ -291,32 +299,70 @@ def main():
     
     # ── Main Content ──
     
-    # Run detection if system is active
-    if st.session_state.system_running:
-        run_detection_cycle()
-    
     # Row 1: Node Status Card (single node)
     st.markdown("## ◈ Node Status")
-    node = st.session_state.node
-    if node:
-        render_node_card(node.get_status())
+    node_placeholder = st.empty()
     
     st.markdown("---")
     
-    # Row 2: Live Audio + Classification
+    # Row 2: Live Audio + Classification (updates smoothly via fragment)
     col_wave, col_class = st.columns([2, 1])
-    
     with col_wave:
         st.markdown("## ◈ Live Audio Waveform")
-        waveform_fig = render_waveform(st.session_state.current_frame)
-        st.plotly_chart(waveform_fig, use_container_width=True, key="waveform")
-    
+        waveform_placeholder = st.empty()
     with col_class:
         st.markdown("## ◈ Classification")
-        class_fig = render_classification_bars(st.session_state.current_predictions)
-        st.plotly_chart(class_fig, use_container_width=True, key="classification")
+        class_placeholder = st.empty()
+        result_placeholder = st.empty()
+    
+    st.markdown("---")
+    
+    # Row 3: Alerts + Deployment Map
+    col_alerts, col_map = st.columns([1, 1])
+    with col_alerts:
+        st.markdown("## ◈ Alert Panel")
+        alert_placeholder = st.empty()
+    with col_map:
+        st.markdown("## ◈ Deployment Map")
+        map_placeholder = st.empty()
+    
+    st.markdown("---")
+    
+    # Row 4: Communication Logs
+    st.markdown("## ◈ Communication Log")
+    col_tx, col_rx = st.columns(2)
+    with col_tx:
+        st.markdown("### LoRa TX Log")
+        tx_placeholder = st.empty()
+    with col_rx:
+        st.markdown("### Base Station RX Log")
+        rx_placeholder = st.empty()
+    
+    # ── Live Update Loop ──
+    # Use st.fragment for smooth in-place updates (no full-page blink)
+    @st.fragment(run_every=1)
+    def live_update():
+        """Fragment that updates dynamic content in-place every 1 second."""
+        if st.session_state.system_running:
+            run_detection_cycle()
         
-        # Current detection result
+        # Update node card
+        node = st.session_state.node
+        if node:
+            with node_placeholder.container():
+                render_node_card(node.get_status())
+        
+        # Update waveform (in-place, no blink)
+        with waveform_placeholder.container():
+            waveform_fig = render_waveform(st.session_state.current_frame)
+            st.plotly_chart(waveform_fig, use_container_width=True, key=f"wf_{st.session_state.total_cycles}")
+        
+        # Update classification bars
+        with class_placeholder.container():
+            class_fig = render_classification_bars(st.session_state.current_predictions)
+            st.plotly_chart(class_fig, use_container_width=True, key=f"cl_{st.session_state.total_cycles}")
+        
+        # Update detection result badge
         preds = st.session_state.current_predictions
         if preds:
             dominant = max(preds, key=preds.get)
@@ -332,57 +378,45 @@ def main():
                 color = "#39FF14"
                 icon = "🟢"
             
-            st.markdown(f"""
-            <div style="text-align: center; padding: 10px; background: #131920; border: 1px solid rgba(57,255,20,0.25);
-                        border-radius: 8px; margin-top: 10px;">
-                <div style="font-family: 'Orbitron', monospace; font-size: 1.2rem; color: {color};">
-                    {icon} {dominant.upper()}
+            with result_placeholder.container():
+                st.markdown(f"""
+                <div style="text-align: center; padding: 10px; background: #131920; border: 1px solid rgba(57,255,20,0.25);
+                            border-radius: 8px; margin-top: 10px;">
+                    <div style="font-family: 'Orbitron', monospace; font-size: 1.2rem; color: {color};">
+                        {icon} {dominant.upper()}
+                    </div>
+                    <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: #6b7280;">
+                        Confidence: {conf:.1%}
+                    </div>
                 </div>
-                <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: #6b7280;">
-                    Confidence: {conf:.1%}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # Row 3: Alerts + Deployment Map
-    col_alerts, col_map = st.columns([1, 1])
-    
-    with col_alerts:
-        st.markdown("## ◈ Alert Panel")
+                """, unsafe_allow_html=True)
+        
+        # Update alerts
         decision_engine = st.session_state.decision_engine
         if decision_engine:
-            alerts = decision_engine.get_active_alerts(15)
-            render_alert_panel(alerts)
-    
-    with col_map:
-        st.markdown("## ◈ Deployment Map")
-        node_statuses = [node.get_status()] if node else []
-        map_fig = render_deployment_map(node_statuses)
-        st.plotly_chart(map_fig, use_container_width=True, key="map")
-    
-    st.markdown("---")
-    
-    # Row 4: Communication Logs
-    st.markdown("## ◈ Communication Log")
-    col_tx, col_rx = st.columns(2)
-    
-    with col_tx:
-        st.markdown("### LoRa TX Log")
+            with alert_placeholder.container():
+                alerts = decision_engine.get_active_alerts(15)
+                render_alert_panel(alerts)
+        
+        # Update map
+        node = st.session_state.node
+        with map_placeholder.container():
+            node_statuses = [node.get_status()] if node else []
+            map_fig = render_deployment_map(node_statuses)
+            st.plotly_chart(map_fig, use_container_width=True, key=f"mp_{st.session_state.total_cycles}")
+        
+        # Update comm logs
         tx = st.session_state.transmitter
-        render_comm_log(tx.get_logs(20) if tx else [])
-    
-    with col_rx:
-        st.markdown("### Base Station RX Log")
+        with tx_placeholder.container():
+            render_comm_log(tx.get_logs(20) if tx else [])
+        
         base_station = st.session_state.base_station
-        if base_station:
-            render_comm_log(base_station.get_logs(20))
+        with rx_placeholder.container():
+            if base_station:
+                render_comm_log(base_station.get_logs(20))
     
-    # Auto-refresh when running
-    if st.session_state.system_running:
-        time.sleep(0.3)
-        st.rerun()
+    # Run the fragment
+    live_update()
 
 
 if __name__ == "__main__":
