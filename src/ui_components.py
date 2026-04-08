@@ -362,7 +362,8 @@ def render_waveform(audio_data: np.ndarray, sample_rate: int = 22050):
         yaxis=dict(
             title='Amplitude', titlefont=dict(size=10, color=THEME["text_secondary"]),
             gridcolor=THEME["grid"], showgrid=True, gridwidth=1,
-            range=[-1, 1],
+            range=[-max(0.01, float(np.max(np.abs(audio_data))) * 1.2),
+                    max(0.01, float(np.max(np.abs(audio_data))) * 1.2)],
         ),
         font=dict(family='JetBrains Mono, monospace', size=10, color=THEME["text_primary"]),
         showlegend=False,

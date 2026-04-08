@@ -2,13 +2,12 @@
 AI Model Integration — Audio Classification Model
 ===================================================
 Loads trained CNN model for real-time acoustic classification.
-Uses lazy TensorFlow imports to avoid blocking Streamlit.
+Synchronous loading — TFLite loads in ~0.03s after TF import (~3s).
 """
 
 import os
 import time
 import logging
-import threading
 import numpy as np
 from typing import Dict, Optional
 
@@ -18,10 +17,7 @@ CLASS_LABELS = ["footstep", "gunshot", "noise"]
 
 
 class AudioClassifier:
-    """
-    Audio classifier with lazy TF loading.
-    Falls back to heuristic until model is ready.
-    """
+    """Audio classifier with TFLite/Keras/fallback support."""
 
     def __init__(self, model_path: Optional[str] = None):
         self.model_path = model_path
@@ -31,33 +27,24 @@ class AudioClassifier:
         self.input_shape = None
         self.class_labels = CLASS_LABELS
         self._inference_times = []
-        self._loading = False
-        self._ready = False
 
         if model_path and os.path.exists(model_path):
-            self._start_background_load(model_path)
+            logger.info(f"[MODEL] Loading from: {model_path}")
+            self._load_model(model_path)
         else:
-            logger.warning(f"[MODEL] No model at {model_path}")
+            logger.warning(f"[MODEL] No model at {model_path}, using fallback")
 
-    def _start_background_load(self, path: str):
-        """Load model in background thread so Streamlit is not blocked."""
-        self._loading = True
-        t = threading.Thread(target=self._bg_load, args=(path,), daemon=True)
-        t.start()
-
-    def _bg_load(self, path: str):
+    def _load_model(self, path: str):
         try:
             if path.endswith(".tflite"):
                 self._load_tflite(path)
             elif path.endswith(".h5") or path.endswith(".keras"):
                 self._load_keras(path)
             else:
-                self.model_type = "fallback"
+                logger.error(f"[MODEL] Unsupported format: {path}")
         except Exception as e:
-            logger.error(f"[MODEL] Load failed: {e}")
+            logger.error(f"[MODEL] Load failed: {e}", exc_info=True)
             self.model_type = "fallback"
-        self._loading = False
-        self._ready = (self.model_type != "fallback")
 
     def _load_keras(self, path: str):
         import tensorflow as tf
@@ -75,13 +62,10 @@ class AudioClassifier:
         self.model_type = "tflite"
         logger.info(f"[MODEL] TFLite loaded: {self.input_shape}")
 
-    # ── Inference ──
-
     def predict(self, features: np.ndarray) -> Dict[str, float]:
         t0 = time.time()
-
         if self.model_type == "keras" and self.model is not None:
-            probs = self._predict_keras(features)
+            probs = self.model.predict(features, verbose=0)[0]
         elif self.model_type == "tflite" and self.interpreter is not None:
             probs = self._predict_tflite(features)
         else:
@@ -99,9 +83,6 @@ class AudioClassifier:
         if total > 0:
             result = {k: v / total for k, v in result.items()}
         return result
-
-    def _predict_keras(self, features):
-        return self.model.predict(features, verbose=0)[0]
 
     def _predict_tflite(self, features):
         inp = self.interpreter.get_input_details()
@@ -127,8 +108,6 @@ class AudioClassifier:
             return probs / probs.sum()
         return np.array([0.33, 0.33, 0.34])
 
-    # ── Info ──
-
     def get_last_inference_time(self):
         return self._inference_times[-1] if self._inference_times else 0.0
 
@@ -136,11 +115,8 @@ class AudioClassifier:
         return float(np.mean(self._inference_times)) if self._inference_times else 0.0
 
     def get_model_info(self) -> Dict:
-        status = self.model_type.upper()
-        if self._loading:
-            status = "LOADING..."
         return {
-            "model_type": status,
+            "model_type": self.model_type or "fallback",
             "model_path": self.model_path,
             "input_shape": str(self.input_shape),
             "classes": self.class_labels,

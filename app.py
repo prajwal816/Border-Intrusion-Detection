@@ -64,17 +64,14 @@ DATASET_DIR = os.path.join(_SCRIPT_DIR, "dataset")
 # Session State Initialization
 # ──────────────────────────────────────────────
 
-def _get_classifier():
-    """Get or create the classifier (loads TF in background thread)."""
-    if "classifier" not in st.session_state:
-        # Prefer TFLite (smaller, faster to load)
-        if os.path.exists(MODEL_TFLITE):
-            st.session_state.classifier = AudioClassifier(model_path=MODEL_TFLITE)
-        elif os.path.exists(MODEL_H5):
-            st.session_state.classifier = AudioClassifier(model_path=MODEL_H5)
-        else:
-            st.session_state.classifier = AudioClassifier(model_path=None)
-    return st.session_state.classifier
+@st.cache_resource
+def _load_classifier():
+    """Load classifier once, cached across reruns. TFLite preferred."""
+    if os.path.exists(MODEL_TFLITE):
+        return AudioClassifier(model_path=MODEL_TFLITE)
+    elif os.path.exists(MODEL_H5):
+        return AudioClassifier(model_path=MODEL_H5)
+    return AudioClassifier(model_path=None)
 
 
 def init_session_state():
@@ -119,11 +116,11 @@ def initialize_system():
     # Decision engine
     st.session_state.decision_engine = DecisionEngine()
     
-    # Audio capture
-    audio_mode = "live" if SOUNDDEVICE_AVAILABLE else "replay"
-    st.session_state.audio_mode = audio_mode
+    # Audio capture — use REPLAY mode for reliable classification demo
+    # (mic signal is too weak for meaningful classification)
+    st.session_state.audio_mode = "replay"
     st.session_state.audio_capture = AudioCapture(
-        mode=audio_mode,
+        mode="replay",
         replay_dir=DATASET_DIR
     )
     
@@ -135,7 +132,7 @@ def initialize_system():
 def run_detection_cycle():
     """Run one complete detection cycle: capture → inference → decision → transmit."""
     audio_capture = st.session_state.audio_capture
-    classifier = _get_classifier()
+    classifier = _load_classifier()
     node = st.session_state.node
     transmitter = st.session_state.transmitter
     base_station = st.session_state.base_station
@@ -201,7 +198,7 @@ def main():
     inject_custom_css()
     
     # Get classifier (loads TF in background)
-    classifier = _get_classifier()
+    classifier = _load_classifier()
     
     # ── Header ──
     render_header()
