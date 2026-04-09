@@ -149,34 +149,48 @@ def run_detection_cycle():
     
     st.session_state.current_frame = frame
     
-    # 2. Check energy level (noise gate)
-    energy = audio_capture.compute_energy(frame)
+    # 2. Compute signal metrics
     rms = float(np.sqrt(np.mean(frame**2)))
     peak = float(np.max(np.abs(frame)))
-    NOISE_GATE_THRESHOLD = 0.01
     
     # 3. Capture & process
     node.capture_audio_frame()
     
     # 4. Extract features & run inference
-    if energy > NOISE_GATE_THRESHOLD:
-        # Meaningful audio — run real inference
-        features = audio_capture.preprocess_for_model(frame)
-        predictions = classifier.predict(features)
-        gate_status = "OPEN"
+    features = audio_capture.preprocess_for_model(frame)
+    raw_predictions = classifier.predict(features)
+    
+    # 5. Energy-based confidence weighting
+    # Quiet signal → bias toward noise (model can't distinguish ambient noise)
+    # Loud signal → trust the model fully
+    QUIET_THRESHOLD = 0.005   # Below this, force noise
+    LOUD_THRESHOLD = 0.05     # Above this, trust model fully
+    
+    noise_prior = {"footstep": 0.02, "gunshot": 0.01, "noise": 0.97}
+    
+    if rms < QUIET_THRESHOLD:
+        # Very quiet — definitely noise
+        model_weight = 0.0
+    elif rms > LOUD_THRESHOLD:
+        # Loud — trust the model
+        model_weight = 1.0
     else:
-        # Below noise gate — classify as noise
-        predictions = {"footstep": 0.02, "gunshot": 0.01, "noise": 0.97}
-        gate_status = "CLOSED"
+        # Blend: scale linearly from 0 to 1
+        model_weight = (rms - QUIET_THRESHOLD) / (LOUD_THRESHOLD - QUIET_THRESHOLD)
+    
+    predictions = {}
+    for k in raw_predictions:
+        predictions[k] = model_weight * raw_predictions[k] + (1 - model_weight) * noise_prior.get(k, 0.0)
     
     # Debug output
     dominant = max(predictions, key=predictions.get)
-    print(f"[CYCLE {st.session_state.total_cycles:03d}] RMS={rms:.6f} Peak={peak:.4f} Energy={energy:.6f} Gate={gate_status} → {dominant}({predictions[dominant]:.1%})")
+    raw_dom = max(raw_predictions, key=raw_predictions.get)
+    print(f"[CYCLE {st.session_state.total_cycles:03d}] RMS={rms:.6f} Peak={peak:.4f} weight={model_weight:.2f} raw={raw_dom} → {dominant}({predictions[dominant]:.1%})")
     
     inference_time = classifier.get_last_inference_time()
     
-    # 5. Smooth predictions (exponential moving average)
-    SMOOTH_ALPHA = 0.4  # 0=fully smooth, 1=no smoothing
+    # 6. Smooth predictions (exponential moving average)
+    SMOOTH_ALPHA = 0.3  # Lower = smoother
     prev = st.session_state.smoothed_predictions
     smoothed = {}
     for k in predictions:
